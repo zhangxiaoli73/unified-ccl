@@ -7,6 +7,9 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 /* Try to include Level Zero for PCI property queries */
 #if __has_include(<level_zero/ze_api.h>)

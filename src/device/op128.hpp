@@ -21,24 +21,16 @@ struct alignas(16) uint128_t {
 
 /* 128-bit volatile load from global memory */
 inline uint128_t load128(const volatile uint128_t* ptr) {
-    /* Use sycl::vec for 128-bit load */
-    const auto* vptr = reinterpret_cast<
-        const volatile sycl::vec<uint64_t, 2>*>(ptr);
-    sycl::vec<uint64_t, 2> val = *vptr;
     uint128_t result;
-    result.lo = val[0];
-    result.hi = val[1];
+    result.lo = ptr->lo;
+    result.hi = ptr->hi;
     return result;
 }
 
 /* 128-bit volatile store to global memory */
 inline void store128(volatile uint128_t* ptr, uint128_t val) {
-    auto* vptr = reinterpret_cast<
-        volatile sycl::vec<uint64_t, 2>*>(ptr);
-    sycl::vec<uint64_t, 2> v;
-    v[0] = val.lo;
-    v[1] = val.hi;
-    *vptr = v;
+    ptr->lo = val.lo;
+    ptr->hi = val.hi;
 }
 
 /* Relaxed atomic load (64-bit) */
@@ -64,21 +56,21 @@ inline void storeRelaxed(uint64_t* ptr, uint64_t val) {
 /* Acquire load (64-bit) — for reading flags */
 inline uint64_t loadAcquire(const uint64_t* ptr) {
     sycl::atomic_ref<uint64_t,
-                     sycl::memory_order::acquire,
+                     sycl::memory_order::acq_rel,
                      sycl::memory_scope::system,
                      sycl::access::address_space::global_space>
         ref(*const_cast<uint64_t*>(ptr));
-    return ref.load();
+    return ref.load(sycl::memory_order::acquire);
 }
 
 /* Release store (64-bit) — for writing flags */
 inline void storeRelease(uint64_t* ptr, uint64_t val) {
     sycl::atomic_ref<uint64_t,
-                     sycl::memory_order::release,
+                     sycl::memory_order::acq_rel,
                      sycl::memory_scope::system,
                      sycl::access::address_space::global_space>
         ref(*ptr);
-    ref.store(val);
+    ref.store(val, sycl::memory_order::release);
 }
 
 /* GPU memory fence (device scope) */

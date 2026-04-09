@@ -3,18 +3,19 @@
 #include "uccl_common.h"
 #include "../protocols/protocol.h"
 
+namespace uccl {
+struct ucclConnInfo;
+}
+
 /* Channel: independent communication lane for bandwidth parallelism.
  * Each channel has its own ring ordering, buffers, and transport connections.
  * Multiple channels run simultaneously, each processing a subset of data. */
 
 /* Peer connection within a channel */
 struct ucclChannelPeer {
-    struct ucclConnInfo send;    /* send-side connection */
-    struct ucclConnInfo recv;    /* recv-side connection */
+    uccl::ucclConnInfo* send;    /* send-side connection */
+    uccl::ucclConnInfo* recv;    /* recv-side connection */
 };
-
-/* Forward declare ucclConnInfo (defined in comm.h) */
-struct ucclConnInfo;
 
 struct ucclChannel {
     int id;

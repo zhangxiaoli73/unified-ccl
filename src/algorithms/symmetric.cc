@@ -1,4 +1,5 @@
 #include "algorithm.h"
+#include "symmetric_context.h"
 #include "../device/reduce_kernel.hpp"
 #include "../include/comm.h"
 #include "../include/channel.h"
@@ -9,16 +10,6 @@
 #include <cstdint>
 
 namespace uccl {
-
-/* Symmetric Memory context.
- * Holds P2P mapped pointers to all GPUs' buffers within one node.
- * Initialized via Level Zero IPC handle exchange during comm init. */
-struct SymmetricMemoryContext {
-    int nGpus;
-    void** remoteBuffs;     /* remoteBuffs[i] = GPU i's buffer mapped locally */
-    size_t buffSize;
-    void* localBuff;
-};
 
 /* Symmetric Memory AllReduce implementation.
  *

@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "../protocols/protocol.h"
 #include "../misc/debug.h"
 
 #include <sycl/sycl.hpp>

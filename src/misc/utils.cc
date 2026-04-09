@@ -4,6 +4,9 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 /* General utility functions */
 

@@ -1,4 +1,5 @@
 #include "algorithm.h"
+#include "symmetric_context.h"
 #include "../include/comm.h"
 #include "../include/hw_resources.h"
 #include "../device/reduce_kernel.hpp"
@@ -29,9 +30,6 @@ namespace uccl {
  *
  * This decouples data movement from computation, allowing the copy engines
  * to run independently of the EU compute pipeline. */
-
-/* Forward declaration of SymmetricMemoryContext */
-struct SymmetricMemoryContext;
 
 /* ============================================================
  * Copy-Engine AllReduce

@@ -3,7 +3,17 @@
 #include "uccl_common.h"
 
 #include <sycl/sycl.hpp>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
+#include <vector>
+
+#if defined(UCCL_HAS_LEVEL_ZERO) && __has_include(<level_zero/ze_api.h>)
+#include <level_zero/ze_api.h>
+#define UCCL_HWRES_HAS_LEVEL_ZERO 1
+#else
+#define UCCL_HWRES_HAS_LEVEL_ZERO 0
+#endif
 
 /* Hardware Resource Descriptor.
  *
@@ -101,9 +111,9 @@ inline ucclResult_t ucclQueryHwResources(ucclHwResources* hw,
     hw->copyEngine.copyQueue = nullptr;
     hw->copyEngine.available = false;
 
-#ifdef UCCL_HAS_LEVEL_ZERO
+#if UCCL_HWRES_HAS_LEVEL_ZERO
     /* Query copy engine count via Level Zero */
-    auto zeDevice = device.get_native<sycl::backend::ext_oneapi_level_zero>();
+    auto zeDevice = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device);
     uint32_t numQueueGroups = 0;
     zeDeviceGetCommandQueueGroupProperties(zeDevice, &numQueueGroups, nullptr);
 
@@ -172,7 +182,7 @@ inline ucclResult_t ucclQueryHwResources(ucclHwResources* hw,
 /* Release hardware resources (free allocated queues, etc.) */
 inline void ucclFreeHwResources(ucclHwResources* hw) {
     if (hw == nullptr) return;
-#ifdef UCCL_HAS_LEVEL_ZERO
+#if UCCL_HWRES_HAS_LEVEL_ZERO
     if (hw->copyEngine.copyQueue != nullptr &&
         hw->copyEngine.copyQueue != hw->computeQueue) {
         delete hw->copyEngine.copyQueue;

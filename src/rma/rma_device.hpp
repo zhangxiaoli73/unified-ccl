@@ -185,7 +185,7 @@ inline void devicePutSignal(
 
         uint64_t* sigPtr = win.remoteSignals[peer] + win.myRank;
         sycl::atomic_ref<uint64_t,
-            sycl::memory_order::release,
+            sycl::memory_order::acq_rel,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>
             ref(*sigPtr);
@@ -229,7 +229,7 @@ inline void deviceGetSignal(
 
         uint64_t* sigPtr = const_cast<uint64_t*>(win.localSignals) + peer;
         sycl::atomic_ref<uint64_t,
-            sycl::memory_order::release,
+            sycl::memory_order::acq_rel,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>
             ref(*sigPtr);
@@ -253,7 +253,7 @@ inline void deviceSignal(
 
     uint64_t* sigPtr = win.remoteSignals[peer] + win.myRank;
     sycl::atomic_ref<uint64_t,
-        sycl::memory_order::release,
+        sycl::memory_order::acq_rel,
         sycl::memory_scope::system,
         sycl::access::address_space::global_space>
         ref(*sigPtr);
@@ -281,12 +281,12 @@ inline void deviceWaitSignal(
     /* Spin-wait with acquire semantics */
     while (true) {
         sycl::atomic_ref<uint64_t,
-            sycl::memory_order::acquire,
+            sycl::memory_order::acq_rel,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>
             ref(*sigPtr);
 
-        uint64_t current = ref.load();
+        uint64_t current = ref.load(sycl::memory_order::acquire);
         if (current >= expectedCount) break;
         /* No explicit yield on GPU — the spin is the wait mechanism */
     }

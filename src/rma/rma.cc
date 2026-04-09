@@ -77,10 +77,13 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
 
 #ifdef UCCL_HAS_LEVEL_ZERO
     /* Level Zero IPC handle exchange */
+    auto zeCtx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+        comm->defaultQueue->get_context());
+    auto zeDev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+        comm->device);
+
     ze_ipc_mem_handle_t localHandle;
-    ze_result_t zeRes = zeMemGetIpcHandle(
-        comm->device.get_native<sycl::backend::ext_oneapi_level_zero>(),
-        buff, &localHandle);
+    ze_result_t zeRes = zeMemGetIpcHandle(zeCtx, buff, &localHandle);
     if (zeRes != ZE_RESULT_SUCCESS) {
         UCCL_LOG(ERROR, "WindowRegister: zeMemGetIpcHandle failed");
         delete[] w->remotePtrs;
@@ -94,12 +97,6 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
     MPI_Allgather(&localHandle, sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
                   allHandles.data(), sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
                   comm->mpiComm);
-
-    /* Open remote handles */
-    auto zeCtx = comm->device.get_platform()
-        .get_native<sycl::backend::ext_oneapi_level_zero>();
-    auto zeDev = comm->device
-        .get_native<sycl::backend::ext_oneapi_level_zero>();
 
     /* Store L0 context for later IPC handle cleanup */
     w->zeContext = reinterpret_cast<void*>(zeCtx);
@@ -122,9 +119,8 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
 
     /* Similarly exchange signal buffer handles */
     ze_ipc_mem_handle_t sigLocalHandle;
-    zeMemGetIpcHandle(
-        comm->device.get_native<sycl::backend::ext_oneapi_level_zero>(),
-        const_cast<uint64_t*>(w->localSignals), &sigLocalHandle);
+    zeMemGetIpcHandle(zeCtx, const_cast<uint64_t*>(w->localSignals),
+                      &sigLocalHandle);
 
     std::vector<ze_ipc_mem_handle_t> sigHandles(comm->nRanks);
     MPI_Allgather(&sigLocalHandle, sizeof(ze_ipc_mem_handle_t), MPI_BYTE,

@@ -29,8 +29,6 @@
  *            // data is now visible in local window
  */
 
-namespace uccl {
-
 /* ============================================================
  * Memory Window — symmetric registered memory region
  * ============================================================ */
@@ -52,6 +50,8 @@ struct ucclWindow {
 };
 
 /* ucclWindow_t is typedef'd in uccl.h; do not redefine here */
+
+namespace uccl {
 
 /* ============================================================
  * Window Registration
