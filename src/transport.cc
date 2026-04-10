@@ -2,6 +2,9 @@
 #include "include/comm.h"
 #include "misc/debug.h"
 
+#include <cstdlib>
+#include <cstring>
+
 /* Transport layer abstraction — mirrors NCCL transport.cc.
  *
  * Provides a unified interface for P2P (intra-node) and
@@ -35,6 +38,19 @@ ucclResult_t transportSetup(ucclComm* comm, int peerRank,
 
     ucclTransportType type = selectTransport(myNode, peerNode);
 
+    /* Allow forcing Net transport via environment variable */
+    const char* forceNet = std::getenv("UCCL_FORCE_NET");
+    if (forceNet && std::strcmp(forceNet, "1") == 0) {
+        UCCL_LOG(INFO, "UCCL_FORCE_NET=1: overriding transport from %s to Net for rank %d -> %d",
+                 (type == UCCL_TRANSPORT_P2P) ? "P2P" : "Net",
+                 comm->rank, peerRank);
+        type = UCCL_TRANSPORT_NET;
+    }
+
+    UCCL_LOG(INFO, "Transport selected: %s for rank %d -> %d",
+             (type == UCCL_TRANSPORT_P2P) ? "P2P" : "Net",
+             comm->rank, peerRank);
+
     if (type == UCCL_TRANSPORT_P2P) {
         UCCL_LOG(INFO, "Transport: P2P for rank %d -> %d",
                  comm->rank, peerRank);
@@ -54,10 +70,7 @@ ucclResult_t transportSetup(ucclComm* comm, int peerRank,
             return ucclSystemError;
         }
 
-        /* In full implementation: exchange addresses via bootstrap,
-         * then setup network connection */
-        return netTransportSetup(comm->net, comm->netContext,
-                                 nullptr /* addr */, conn);
+        return netTransportSetup(comm, peerRank, conn);
     }
 }
 

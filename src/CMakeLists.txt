@@ -62,12 +62,9 @@ if(L0_FOUND)
     target_compile_definitions(uccl PRIVATE UCCL_HAS_LEVEL_ZERO=1)
 endif()
 
-# UCX (optional, for built-in plugin)
-if(UCX_FOUND)
-    target_include_directories(uccl PRIVATE ${UCX_INCLUDE_DIRS})
-    target_link_libraries(uccl PRIVATE ${UCX_LIBRARIES})
-    target_compile_definitions(uccl PRIVATE UCCL_HAS_UCX=1)
-endif()
+# UCX (built from third_party)
+target_link_libraries(uccl PRIVATE ucx::ucp ucx::uct ucx::ucs)
+target_compile_definitions(uccl PRIVATE UCCL_HAS_UCX=1)
 
 # dl for dynamic plugin loading
 if(UNIX)

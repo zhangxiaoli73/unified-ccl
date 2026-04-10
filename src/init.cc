@@ -136,12 +136,6 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
         }
     }
 
-    /* Create proxy threads for network I/O */
-    res = uccl::ucclProxyCreate(c);
-    if (res != ucclSuccess) {
-        UCCL_LOG(WARN, "Proxy creation failed");
-    }
-
     /* Exchange peer info via MPI AllGather */
     c->peerInfo = new uccl::ucclPeerInfo[nranks];
     uccl::ucclPeerInfo myInfo;
@@ -160,6 +154,13 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
         uniqueHosts.insert(c->peerInfo[i].hostHash);
     }
     c->nNodes = static_cast<int>(uniqueHosts.size());
+
+    /* Create proxy threads for network I/O.
+     * Must be after peer info exchange so nNodes is set correctly. */
+    res = uccl::ucclProxyCreate(c);
+    if (res != ucclSuccess) {
+        UCCL_LOG(WARN, "Proxy creation failed");
+    }
 
     UCCL_LOG(INFO, "CommInitRank complete: rank=%d, nRanks=%d, "
              "nNodes=%d, localRank=%d",

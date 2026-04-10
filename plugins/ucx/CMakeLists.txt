@@ -5,11 +5,11 @@ add_library(uccl-net-ucx SHARED plugin.cc)
 
 target_include_directories(uccl-net-ucx PRIVATE
     ${CMAKE_SOURCE_DIR}/src/include
-    ${UCX_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(uccl-net-ucx PRIVATE
-    ${UCX_LIBRARIES}
+    ucx::ucp ucx::uct ucx::ucs
 )
 
 install(TARGETS uccl-net-ucx

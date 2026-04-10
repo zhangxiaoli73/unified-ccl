@@ -1,5 +1,6 @@
 #include "include/comm.h"
 #include "include/uccl_net.h"
+#include "transport/transport.h"
 #include "misc/debug.h"
 
 #include <thread>
@@ -71,6 +72,11 @@ static void proxyProgressFunc(ucclProxyState* state, ucclComm* comm) {
                  * 3. When recv completes, update connFifo->tail
                  *    so GPU kernel can read the data */
             }
+        }
+
+        /* Drive UCX worker progress to advance async operations */
+        if (state->net != nullptr && state->net->progress != nullptr) {
+            state->net->progress(state->netContext);
         }
 
         /* Yield to avoid busy-waiting when idle.

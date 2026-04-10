@@ -5,6 +5,9 @@
 
 #include <sycl/sycl.hpp>
 
+/* Forward declaration */
+struct ucclComm;
+
 namespace uccl {
 
 /* Transport types */
@@ -52,9 +55,10 @@ ucclResult_t p2pTransportClose(ucclTransportConn* conn);
  * Proxy thread calls these asynchronously.
  * ============================================================ */
 
-ucclResult_t netTransportSetup(ucclNet_t* net,
-                               void* netHandle,
-                               void* connectAddr,
+/* Net transport setup with bootstrap address exchange.
+ * Establishes bidirectional connection (sendComm + recvComm)
+ * between this rank and a peer rank using MPI for address exchange. */
+ucclResult_t netTransportSetup(ucclComm* comm, int peerRank,
                                ucclTransportConn* conn);
 
 ucclResult_t netTransportSend(ucclNet_t* net,

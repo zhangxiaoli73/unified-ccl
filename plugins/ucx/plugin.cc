@@ -257,6 +257,19 @@ static ucclResult_t ucxPluginCloseListen(void* listenComm) {
     return ucclSuccess;
 }
 
+static ucclResult_t ucxPluginProgress(void* handle) {
+    (void)handle;
+    /* In full implementation: ucp_worker_progress(ctx->ucpWorker); */
+    return ucclSuccess;
+}
+
+static ucclResult_t ucxPluginSetTag(void* comm, uint64_t tag) {
+    (void)comm;
+    (void)tag;
+    /* In full implementation: static_cast<UcxConn*>(comm)->tag = tag; */
+    return ucclSuccess;
+}
+
 /* ============================================================
  * Exported plugin symbol
  * ============================================================ */
@@ -279,7 +292,9 @@ ucclNet_t ucclNetPlugin_v1 = {
     ucxPluginTest,
     ucxPluginCloseSend,
     ucxPluginCloseRecv,
-    ucxPluginCloseListen
+    ucxPluginCloseListen,
+    ucxPluginProgress,
+    ucxPluginSetTag
 };
 
 } /* extern "C" */

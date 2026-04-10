@@ -53,6 +53,14 @@ typedef struct {
     ucclResult_t (*closeSend)(void* sendComm);
     ucclResult_t (*closeRecv)(void* recvComm);
     ucclResult_t (*closeListen)(void* listenComm);
+
+    /* Progress engine: drive async operations forward.
+     * Must be called periodically (e.g., from proxy thread). */
+    ucclResult_t (*progress)(void* handle);
+
+    /* Set tag on a send/recv comm for message disambiguation.
+     * Called after connect/accept to assign deterministic tags. */
+    ucclResult_t (*setTag)(void* comm, uint64_t tag);
 } ucclNet_t;
 
 /* Plugin discovery: dynamic library exports this symbol */

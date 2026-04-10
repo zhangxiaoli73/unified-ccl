@@ -21,6 +21,9 @@ option(UCCL_BUILD_TESTS "Build tests" ON)
 option(UCCL_BUILD_PYTHON "Build Python bindings" ON)
 option(UCCL_BUILD_UCX_PLUGIN "Build external UCX plugin" ON)
 
+# Third-party dependencies
+add_subdirectory(third_party)
+
 # Dependencies
 find_package(MPI REQUIRED)
 
@@ -31,12 +34,6 @@ if(UCCL_BUILD_PYTHON)
         message(WARNING "pybind11 not found, Python bindings will not be built")
         set(UCCL_BUILD_PYTHON OFF)
     endif()
-endif()
-
-# UCX (optional, for built-in plugin)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(UCX QUIET ucx)
 endif()
 
 # Level Zero
@@ -54,7 +51,7 @@ if(UCCL_BUILD_PYTHON)
 endif()
 
 # External UCX plugin
-if(UCCL_BUILD_UCX_PLUGIN AND UCX_FOUND)
+if(UCCL_BUILD_UCX_PLUGIN)
     add_subdirectory(plugins/ucx)
 endif()
 
