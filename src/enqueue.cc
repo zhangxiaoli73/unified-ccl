@@ -31,6 +31,13 @@ ucclResult_t launchRingAllReduce(sycl::queue& queue,
                                  size_t count, int nranks, int rank,
                                  ucclChannel& channel, int protocol);
 
+/* Net Ring AllReduce: persistent kernel via FIFO + proxy */
+template <typename T>
+ucclResult_t launchRingAllReduceNet(sycl::queue& queue,
+                                     const T* sendbuff, T* recvbuff,
+                                     size_t count, int nranks, int rank,
+                                     ucclChannel& channel);
+
 template <typename T>
 ucclResult_t launchOneShotAllReduce(sycl::queue& queue,
                                     const T* sendbuff, T* recvbuff,
@@ -291,7 +298,13 @@ ucclResult_t enqueueAllReduce(const void* sendbuff, void* recvbuff,
                     res = launchOneShotAllReduce<sycl::half>(
                         *stream, send, recv, chCount,
                         comm->nRanks, comm->rank, channel, proto);
+                } else if (comm->nNodes > 1) {
+                    /* Multi-node: Net kernel via FIFO + proxy */
+                    res = launchRingAllReduceNet<sycl::half>(
+                        *stream, send, recv, chCount,
+                        comm->nRanks, comm->rank, channel);
                 } else {
+                    /* Single-node: P2P kernel (direct IPC) */
                     res = launchRingAllReduce<sycl::half>(
                         *stream, send, recv, chCount,
                         comm->nRanks, comm->rank, channel, proto);
@@ -306,6 +319,10 @@ ucclResult_t enqueueAllReduce(const void* sendbuff, void* recvbuff,
                     res = launchOneShotAllReduce<bf16>(
                         *stream, send, recv, chCount,
                         comm->nRanks, comm->rank, channel, proto);
+                } else if (comm->nNodes > 1) {
+                    res = launchRingAllReduceNet<bf16>(
+                        *stream, send, recv, chCount,
+                        comm->nRanks, comm->rank, channel);
                 } else {
                     res = launchRingAllReduce<bf16>(
                         *stream, send, recv, chCount,

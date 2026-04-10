@@ -271,50 +271,57 @@ inline void deviceSignal(
  * devicePutSignal() is guaranteed visible in local memory.
  * ============================================================ */
 
-inline void deviceWaitSignal(
+inline bool deviceWaitSignal(
     const ucclDeviceWindow& win,
     int peer,
-    uint64_t expectedCount)
+    uint64_t expectedCount,
+    uint64_t maxSpins = 100'000'000ULL)
 {
     uint64_t* sigPtr = const_cast<uint64_t*>(win.localSignals) + peer;
 
-    /* Spin-wait with acquire semantics */
-    while (true) {
+    /* Bounded spin-wait with acquire semantics.
+     * Returns true if signal arrived, false on timeout. */
+    for (uint64_t spin = 0; spin < maxSpins; spin++) {
         sycl::atomic_ref<uint64_t,
-            sycl::memory_order::acq_rel,
+            sycl::memory_order::acquire,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>
             ref(*sigPtr);
 
-        uint64_t current = ref.load(sycl::memory_order::acquire);
-        if (current >= expectedCount) break;
-        /* No explicit yield on GPU — the spin is the wait mechanism */
+        if (ref.load() >= expectedCount) return true;
     }
+    return false; /* timeout */
 }
 
 /* Cooperative version: work-item 0 waits, then broadcasts via barrier */
-inline void deviceWaitSignalCooperative(
+inline bool deviceWaitSignalCooperative(
     const ucclDeviceWindow& win,
     int peer,
     uint64_t expectedCount,
-    sycl::nd_item<1> item)
+    sycl::nd_item<1> item,
+    uint64_t maxSpins = 100'000'000ULL)
 {
+    bool ok = true;
     if (item.get_local_id(0) == 0) {
-        deviceWaitSignal(win, peer, expectedCount);
+        ok = deviceWaitSignal(win, peer, expectedCount, maxSpins);
     }
     sycl::group_barrier(item.get_group());
+    return ok;
 }
 
 /* Wait for signals from multiple peers */
-inline void deviceWaitSignalMulti(
+inline bool deviceWaitSignalMulti(
     const ucclDeviceWindow& win,
     const int* peers,
     const uint64_t* expectedCounts,
-    int nPeers)
+    int nPeers,
+    uint64_t maxSpins = 100'000'000ULL)
 {
     for (int p = 0; p < nPeers; p++) {
-        deviceWaitSignal(win, peers[p], expectedCounts[p]);
+        if (!deviceWaitSignal(win, peers[p], expectedCounts[p], maxSpins))
+            return false;
     }
+    return true;
 }
 
 /* ============================================================

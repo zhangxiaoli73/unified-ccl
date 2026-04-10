@@ -4,6 +4,7 @@
 #include "uccl_net.h"
 #include "channel.h"
 #include "hw_resources.h"
+#include "fifo.h"
 #include "../protocols/protocol.h"
 #include "../topo/topo.h"
 
@@ -18,14 +19,6 @@ namespace uccl {
 /* Forward declarations */
 struct ucclProxyState;
 struct SymmetricMemoryContext;
-
-/* Connection FIFO for GPU kernel <-> proxy thread synchronization */
-struct ucclConnFifo {
-    volatile uint64_t head;      /* proxy updates (received / readable) */
-    volatile uint64_t tail;      /* GPU kernel updates (written / sendable) */
-    void* buffs[UCCL_STEPS];     /* ring buffer slots */
-    size_t sizes[UCCL_STEPS];    /* data size per slot */
-};
 
 /* Connection info for a peer */
 struct ucclConnInfo {
@@ -43,17 +36,6 @@ struct ucclPeerInfo {
     int node;
     uint64_t hostHash;
     uint64_t pidHash;
-};
-
-/* Proxy operation descriptor */
-struct ucclProxyOp {
-    int channelId;
-    int peer;                    /* remote rank */
-    size_t nbytes;
-    size_t chunkSize;
-    int nsteps;                  /* transfer steps */
-    int protocol;                /* SIMPLE / LL128 */
-    ucclConnInfo* connection;    /* transport connection */
 };
 
 /* Proxy thread state */

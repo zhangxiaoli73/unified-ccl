@@ -187,6 +187,7 @@ struct ucclWaitSignalDesc {
     int peer;       /* Peer rank */
     int sigIdx;     /* Signal index (must be 0 for now) */
     int ctx;        /* Context identifier (must be 0 for now) */
+    ucclWindow_t win; /* Window containing signal counters */
 };
 
 typedef struct ucclWaitSignalDesc ucclWaitSignalDesc_t;

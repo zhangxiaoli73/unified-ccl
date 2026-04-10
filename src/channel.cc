@@ -2,6 +2,7 @@
 #include "include/channel.h"
 #include "protocols/protocol.h"
 #include "topo/topo.h"
+#include "transport/transport.h"
 #include "misc/debug.h"
 
 #include <sycl/sycl.hpp>
@@ -15,6 +16,7 @@
  * - Ring ordering (prev/next pointers)
  * - Protocol buffers (FIFO for Simple, lines for LL128)
  * - Transport connections to peers
+ * - Send/recv FIFOs and bounce buffers (for Net transport)
  */
 
 namespace uccl {
@@ -24,6 +26,155 @@ ucclResult_t simpleProtocolInit(sycl::queue& queue, ucclChannel& channel);
 ucclResult_t simpleProtocolDestroy(sycl::queue& queue, ucclChannel& channel);
 ucclResult_t ll128ProtocolInit(sycl::queue& queue, ucclChannel& channel);
 ucclResult_t ll128ProtocolDestroy(sycl::queue& queue, ucclChannel& channel);
+
+/* Bounce buffer slot size: 512 KB (matches Simple protocol slice) */
+static constexpr size_t kBounceSlotSize = 512 * 1024;
+
+/* Allocate a ucclConnFifo in pinned host memory (GPU-accessible). */
+static ucclConnFifo* allocFifo(sycl::queue& queue) {
+    auto* fifo = static_cast<ucclConnFifo*>(
+        sycl::malloc_host(sizeof(ucclConnFifo), queue));
+    if (fifo == nullptr) return nullptr;
+    std::memset(fifo, 0, sizeof(ucclConnFifo));
+    return fifo;
+}
+
+/* Allocate bounce buffers: UCCL_STEPS slots of device memory.
+ * Optionally register each slot with the network plugin for RDMA. */
+static ucclResult_t allocBounceBuffers(sycl::queue& queue,
+                                        ucclBounceBuffers* bb,
+                                        ucclNet_t* net,
+                                        void* netComm,
+                                        size_t slotSize) {
+    bb->slotSize = slotSize;
+    for (int i = 0; i < UCCL_STEPS; i++) {
+        bb->buffs[i] = sycl::malloc_device(slotSize, queue);
+        if (bb->buffs[i] == nullptr) {
+            UCCL_LOG(ERROR, "Failed to alloc bounce buffer slot %d "
+                     "(%zu bytes)", i, slotSize);
+            return ucclSystemError;
+        }
+        queue.memset(bb->buffs[i], 0, slotSize).wait();
+
+        /* Register with NIC for RDMA */
+        bb->mhandles[i] = nullptr;
+        if (net != nullptr && netComm != nullptr) {
+            ucclResult_t res = net->regMr(netComm, bb->buffs[i],
+                                          slotSize, UCCL_PTR_DEVICE,
+                                          &bb->mhandles[i]);
+            if (res != ucclSuccess) {
+                UCCL_LOG(WARN, "regMr failed for bounce slot %d", i);
+            }
+        }
+    }
+    return ucclSuccess;
+}
+
+/* Free bounce buffers and deregister from NIC. */
+static void freeBounceBuffers(sycl::queue& queue,
+                               ucclBounceBuffers* bb,
+                               ucclNet_t* net,
+                               void* netComm) {
+    for (int i = 0; i < UCCL_STEPS; i++) {
+        if (bb->mhandles[i] != nullptr && net != nullptr && netComm != nullptr) {
+            net->deregMr(netComm, bb->mhandles[i]);
+            bb->mhandles[i] = nullptr;
+        }
+        if (bb->buffs[i] != nullptr) {
+            sycl::free(bb->buffs[i], queue);
+            bb->buffs[i] = nullptr;
+        }
+    }
+    bb->slotSize = 0;
+}
+
+/* Setup net transport connections for a channel (send to next, recv from prev).
+ * Also allocates FIFOs and bounce buffers for the channel. */
+static ucclResult_t channelNetSetup(ucclComm* comm, ucclChannel& channel) {
+    if (comm->net == nullptr || comm->defaultQueue == nullptr) {
+        return ucclSuccess;  /* No net plugin — skip */
+    }
+
+    sycl::queue& queue = *comm->defaultQueue;
+
+    /* Allocate send and recv FIFOs (pinned host memory) */
+    channel.sendFifo = allocFifo(queue);
+    channel.recvFifo = allocFifo(queue);
+    if (channel.sendFifo == nullptr || channel.recvFifo == nullptr) {
+        UCCL_LOG(ERROR, "Failed to alloc FIFOs for channel %d", channel.id);
+        return ucclSystemError;
+    }
+
+    /* Setup net transport: send to ring.next, recv from ring.prev */
+    ucclTransportConn sendConn{}, recvConn{};
+    ucclResult_t res;
+
+    res = netTransportSetup(comm, channel.ring.next, &sendConn);
+    if (res != ucclSuccess) {
+        UCCL_LOG(ERROR, "Net send setup failed for channel %d -> rank %d",
+                 channel.id, channel.ring.next);
+        return res;
+    }
+    channel.sendNetComm = sendConn.sendComm;
+
+    res = netTransportSetup(comm, channel.ring.prev, &recvConn);
+    if (res != ucclSuccess) {
+        UCCL_LOG(ERROR, "Net recv setup failed for channel %d <- rank %d",
+                 channel.id, channel.ring.prev);
+        return res;
+    }
+    channel.recvNetComm = recvConn.recvComm;
+
+    /* Allocate bounce buffers (device memory + regMr) */
+    res = allocBounceBuffers(queue, &channel.bounceSend, comm->net,
+                             channel.sendNetComm, kBounceSlotSize);
+    if (res != ucclSuccess) return res;
+
+    res = allocBounceBuffers(queue, &channel.bounceRecv, comm->net,
+                             channel.recvNetComm, kBounceSlotSize);
+    if (res != ucclSuccess) return res;
+
+    UCCL_LOG(INFO, "Channel %d net setup: send->rank %d, recv<-rank %d, "
+             "bounce %zu bytes/slot",
+             channel.id, channel.ring.next, channel.ring.prev,
+             kBounceSlotSize);
+
+    return ucclSuccess;
+}
+
+/* Teardown net resources for a channel. */
+static void channelNetDestroy(ucclComm* comm, ucclChannel& channel) {
+    if (comm->defaultQueue == nullptr) return;
+    sycl::queue& queue = *comm->defaultQueue;
+
+    /* Free bounce buffers */
+    freeBounceBuffers(queue, &channel.bounceSend, comm->net,
+                      channel.sendNetComm);
+    freeBounceBuffers(queue, &channel.bounceRecv, comm->net,
+                      channel.recvNetComm);
+
+    /* Close net connections */
+    if (comm->net != nullptr) {
+        if (channel.sendNetComm != nullptr) {
+            comm->net->closeSend(channel.sendNetComm);
+            channel.sendNetComm = nullptr;
+        }
+        if (channel.recvNetComm != nullptr) {
+            comm->net->closeRecv(channel.recvNetComm);
+            channel.recvNetComm = nullptr;
+        }
+    }
+
+    /* Free FIFOs */
+    if (channel.sendFifo != nullptr) {
+        sycl::free(channel.sendFifo, queue);
+        channel.sendFifo = nullptr;
+    }
+    if (channel.recvFifo != nullptr) {
+        sycl::free(channel.recvFifo, queue);
+        channel.recvFifo = nullptr;
+    }
+}
 
 /* Initialize all channels for a communicator */
 ucclResult_t channelInit(ucclComm* comm) {
@@ -109,6 +260,15 @@ ucclResult_t channelInit(ucclComm* comm) {
             }
         }
 
+        /* Setup net transport resources (FIFOs + bounce buffers)
+         * only when multi-node communication is needed */
+        if (comm->nNodes > 1) {
+            ucclResult_t res = channelNetSetup(comm, channel);
+            if (res != ucclSuccess) {
+                UCCL_LOG(WARN, "Net setup failed on channel %d", ch);
+            }
+        }
+
         UCCL_LOG(INFO, "Channel %d init: ring prev=%d, next=%d, "
                  "index=%d",
                  ch, channel.ring.prev, channel.ring.next,
@@ -131,6 +291,9 @@ ucclResult_t channelDestroy(ucclComm* comm) {
 
     for (int ch = 0; ch < comm->nChannels; ch++) {
         ucclChannel& channel = comm->channels[ch];
+
+        /* Free net transport resources */
+        channelNetDestroy(comm, channel);
 
         /* Free protocol buffers */
         if (comm->defaultQueue != nullptr) {

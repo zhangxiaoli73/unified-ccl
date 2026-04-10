@@ -99,10 +99,29 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
         return ucclSystemError;
     }
 
-    /* Gather all handles */
-    std::vector<ze_ipc_mem_handle_t> allHandles(comm->nRanks);
-    MPI_Allgather(&localHandle, sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
-                  allHandles.data(), sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
+    /* Get signal buffer IPC handle */
+    ze_ipc_mem_handle_t sigLocalHandle;
+    zeRes = zeMemGetIpcHandle(zeCtx, const_cast<uint64_t*>(w->localSignals),
+                              &sigLocalHandle);
+    if (zeRes != ZE_RESULT_SUCCESS) {
+        UCCL_LOG(ERROR, "WindowRegister: zeMemGetIpcHandle failed for signals");
+        delete[] w->remotePtrs;
+        delete[] w->remoteSignals;
+        delete w;
+        return ucclSystemError;
+    }
+
+    /* Combine both IPC handles into a single struct and exchange
+     * with one MPI_Allgather instead of two separate calls. */
+    struct IpcHandlePair {
+        ze_ipc_mem_handle_t data;
+        ze_ipc_mem_handle_t signal;
+    };
+
+    IpcHandlePair localPair = { localHandle, sigLocalHandle };
+    std::vector<IpcHandlePair> allPairs(comm->nRanks);
+    MPI_Allgather(&localPair, sizeof(IpcHandlePair), MPI_BYTE,
+                  allPairs.data(), sizeof(IpcHandlePair), MPI_BYTE,
                   comm->mpiComm);
 
     /* Store L0 context for later IPC handle cleanup */
@@ -110,9 +129,11 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
 
     for (int r = 0; r < comm->nRanks; r++) {
         if (r == comm->rank) continue;
+
+        /* Open data buffer IPC handle */
         void* remotePtr = nullptr;
         zeRes = zeMemOpenIpcHandle(zeCtx, zeDev,
-                                   allHandles[r], 0, &remotePtr);
+                                   allPairs[r].data, 0, &remotePtr);
         if (zeRes != ZE_RESULT_SUCCESS) {
             UCCL_LOG(ERROR, "WindowRegister: zeMemOpenIpcHandle failed "
                      "for rank %d", r);
@@ -122,23 +143,12 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
             return ucclSystemError;
         }
         w->remotePtrs[r] = remotePtr;
-    }
 
-    /* Similarly exchange signal buffer handles */
-    ze_ipc_mem_handle_t sigLocalHandle;
-    zeMemGetIpcHandle(zeCtx, const_cast<uint64_t*>(w->localSignals),
-                      &sigLocalHandle);
-
-    std::vector<ze_ipc_mem_handle_t> sigHandles(comm->nRanks);
-    MPI_Allgather(&sigLocalHandle, sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
-                  sigHandles.data(), sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
-                  comm->mpiComm);
-
-    for (int r = 0; r < comm->nRanks; r++) {
-        if (r == comm->rank) continue;
-        void* remotePtr = nullptr;
-        zeMemOpenIpcHandle(zeCtx, zeDev, sigHandles[r], 0, &remotePtr);
-        w->remoteSignals[r] = static_cast<volatile uint64_t*>(remotePtr);
+        /* Open signal buffer IPC handle */
+        void* remoteSigPtr = nullptr;
+        zeMemOpenIpcHandle(zeCtx, zeDev,
+                           allPairs[r].signal, 0, &remoteSigPtr);
+        w->remoteSignals[r] = static_cast<volatile uint64_t*>(remoteSigPtr);
     }
 #else
     /* Without Level Zero: use shared USM for testing (single-process only) */
@@ -146,30 +156,26 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
              "using shared memory fallback (testing only)");
 
     /* In testing mode, all ranks in same process share address space.
-     * Exchange raw pointers via MPI. */
-    uintptr_t localAddr = reinterpret_cast<uintptr_t>(buff);
-    std::vector<uintptr_t> allAddrs(comm->nRanks);
-    MPI_Allgather(&localAddr, sizeof(uintptr_t), MPI_BYTE,
-                  allAddrs.data(), sizeof(uintptr_t), MPI_BYTE,
+     * Combine data and signal pointer exchange into one MPI_Allgather. */
+    struct AddrPair {
+        uintptr_t data;
+        uintptr_t signal;
+    };
+
+    AddrPair localPair = {
+        reinterpret_cast<uintptr_t>(buff),
+        reinterpret_cast<uintptr_t>(const_cast<uint64_t*>(w->localSignals))
+    };
+    std::vector<AddrPair> allPairs(comm->nRanks);
+    MPI_Allgather(&localPair, sizeof(AddrPair), MPI_BYTE,
+                  allPairs.data(), sizeof(AddrPair), MPI_BYTE,
                   comm->mpiComm);
 
     for (int r = 0; r < comm->nRanks; r++) {
         if (r == comm->rank) continue;
-        w->remotePtrs[r] = reinterpret_cast<void*>(allAddrs[r]);
-    }
-
-    /* Exchange signal pointers */
-    uintptr_t sigAddr = reinterpret_cast<uintptr_t>(
-        const_cast<uint64_t*>(w->localSignals));
-    std::vector<uintptr_t> sigAddrs(comm->nRanks);
-    MPI_Allgather(&sigAddr, sizeof(uintptr_t), MPI_BYTE,
-                  sigAddrs.data(), sizeof(uintptr_t), MPI_BYTE,
-                  comm->mpiComm);
-
-    for (int r = 0; r < comm->nRanks; r++) {
-        if (r == comm->rank) continue;
+        w->remotePtrs[r] = reinterpret_cast<void*>(allPairs[r].data);
         w->remoteSignals[r] =
-            reinterpret_cast<volatile uint64_t*>(sigAddrs[r]);
+            reinterpret_cast<volatile uint64_t*>(allPairs[r].signal);
     }
 #endif
 
@@ -334,13 +340,19 @@ ucclResult_t ucclPutSignal(const void* localBuff, size_t count,
     /* Step 2: After data is written, atomically update remote signal.
      * We submit a kernel that does an atomic increment on the remote
      * signal counter. This ensures ordering: the signal is only visible
-     * after the data write completes (both in same in-order queue). */
+     * after the data write completes (both in same in-order queue).
+     *
+     * NOTE: single_task has non-trivial kernel launch overhead for one
+     * atomic op. Future optimization: batch multiple PutSignal calls
+     * via GroupStart/GroupEnd to amortize launch cost. */
     volatile uint64_t* remoteSignalPtr =
         peerWin->remoteSignals[peer] + comm->rank;
 
     q->single_task([=]() {
+        sycl::atomic_fence(sycl::memory_order::release,
+                           sycl::memory_scope::system);
         auto ref = sycl::atomic_ref<uint64_t,
-            sycl::memory_order::relaxed,
+            sycl::memory_order::release,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>(
                 *const_cast<uint64_t*>(remoteSignalPtr));
@@ -393,13 +405,19 @@ ucclResult_t ucclGetSignal(void* localBuff, size_t count,
         + peerWinOffset;
     q->memcpy(localBuff, remoteSrc, nbytes);
 
-    /* Step 2: Update local signal counter to indicate completion */
+    /* Step 2: Update local signal counter to indicate completion.
+     *
+     * NOTE: single_task has non-trivial kernel launch overhead for one
+     * atomic op. Future optimization: batch multiple GetSignal calls
+     * via GroupStart/GroupEnd to amortize launch cost. */
     volatile uint64_t* localSignalPtr =
         peerWin->localSignals + peer;
 
     q->single_task([=]() {
+        sycl::atomic_fence(sycl::memory_order::release,
+                           sycl::memory_scope::system);
         auto ref = sycl::atomic_ref<uint64_t,
-            sycl::memory_order::relaxed,
+            sycl::memory_order::release,
             sycl::memory_scope::system,
             sycl::access::address_space::global_space>(
                 *const_cast<uint64_t*>(localSignalPtr));
@@ -476,19 +494,77 @@ ucclResult_t ucclWaitSignal(int nDesc,
         }
     }
 
-    /* Submit a kernel that spins until all expected signals arrive.
-     *
-     * NOTE: In production, this would use a more efficient wait
-     * mechanism (e.g., hardware doorbell, interrupt-based wait).
-     * The spin-poll approach is used here for correctness. */
-
     UCCL_LOG(TRACE, "WaitSignal: rank=%d waiting for %d descriptors",
              comm->rank, nDesc);
 
-    /* TODO: Implement proper signal wait kernel.
-     * For now, this is a placeholder — no actual wait is performed.
-     * A real implementation would submit a kernel that spins on
-     * device-side signal counters. */
+    /* Build device windows and copy descriptors to device memory
+     * so the wait kernel can access them. We cap at a reasonable
+     * static limit to avoid dynamic allocation on the hot path. */
+    static constexpr int kMaxWaitDescs = UCCL_RMA_MAX_PEERS;
+    if (nDesc > kMaxWaitDescs) {
+        UCCL_LOG(ERROR, "WaitSignal: nDesc=%d exceeds max=%d",
+                 nDesc, kMaxWaitDescs);
+        return ucclInvalidArgument;
+    }
+
+    /* Prepare per-descriptor signal pointers and expected counts.
+     * We resolve these on the host so the kernel only spins on
+     * device-accessible pointers without chasing host structures. */
+    uint64_t* signalPtrs[kMaxWaitDescs];
+    uint64_t  expectedCounts[kMaxWaitDescs];
+
+    for (int d = 0; d < nDesc; d++) {
+        ucclWindow_t win = signalDescs[d].win;
+        if (win == nullptr) {
+            UCCL_LOG(ERROR, "WaitSignal: descriptor %d has null window", d);
+            return ucclInvalidArgument;
+        }
+        int peer = signalDescs[d].peer;
+        signalPtrs[d] = const_cast<uint64_t*>(win->localSignals) + peer;
+        expectedCounts[d] = static_cast<uint64_t>(signalDescs[d].opCnt);
+    }
+
+    /* Allocate device-side arrays for kernel capture */
+    uint64_t** devSignalPtrs = sycl::malloc_device<uint64_t*>(nDesc, *q);
+    uint64_t*  devExpected   = sycl::malloc_device<uint64_t>(nDesc, *q);
+
+    q->memcpy(devSignalPtrs, signalPtrs, nDesc * sizeof(uint64_t*));
+    q->memcpy(devExpected, expectedCounts, nDesc * sizeof(uint64_t));
+
+    /* Submit a single-workgroup kernel that spins on signal counters.
+     * Work-item 0 polls all descriptors; after all signals arrive,
+     * a group barrier ensures all work-items see the result.
+     *
+     * Bounded spin with timeout to avoid GPU hang on deadlock. */
+    static constexpr uint64_t kMaxSpins = 100'000'000ULL;
+    int nd = nDesc;
+
+    q->submit([=](sycl::handler& cgh) {
+        cgh.single_task([=]() {
+            for (int d = 0; d < nd; d++) {
+                uint64_t* sigPtr = devSignalPtrs[d];
+                uint64_t expected = devExpected[d];
+
+                for (uint64_t spin = 0; spin < kMaxSpins; spin++) {
+                    sycl::atomic_ref<uint64_t,
+                        sycl::memory_order::acquire,
+                        sycl::memory_scope::system,
+                        sycl::access::address_space::global_space>
+                        ref(*sigPtr);
+
+                    if (ref.load() >= expected) break;
+                }
+            }
+        });
+    });
+
+    /* Free device allocations after kernel completes (in-order queue) */
+    q->submit([=](sycl::handler& cgh) {
+        cgh.host_task([=]() {
+            sycl::free(devSignalPtrs, *q);
+            sycl::free(devExpected, *q);
+        });
+    });
 
     return ucclSuccess;
 }

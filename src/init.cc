@@ -108,14 +108,7 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
     c->defaultQueue = nullptr;
     c->topo = nullptr;
 
-    /* Initialize channels */
-    res = uccl::channelInit(c);
-    if (res != ucclSuccess) {
-        delete c;
-        return res;
-    }
-
-    /* Load network plugin */
+    /* Load network plugin (before channel init, needed for bounce buffer regMr) */
     res = uccl::autoLoadNetPlugin(&c->net);
     if (res != ucclSuccess) {
         UCCL_LOG(WARN, "Network plugin load failed, "
@@ -144,15 +137,22 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
         c->peerInfo[0] = myInfo;
     }
 
-    /* Determine node count */
+    /* Determine node count (must be before channelInit for net setup) */
     std::set<uint64_t> uniqueHosts;
     for (int i = 0; i < nranks; i++) {
         uniqueHosts.insert(c->peerInfo[i].hostHash);
     }
     c->nNodes = static_cast<int>(uniqueHosts.size());
 
+    /* Initialize channels (allocates FIFOs + bounce buffers if multi-node) */
+    res = uccl::channelInit(c);
+    if (res != ucclSuccess) {
+        delete c;
+        return res;
+    }
+
     /* Create proxy threads for network I/O.
-     * Must be after peer info exchange so nNodes is set correctly. */
+     * Must be after channel init so FIFOs are ready. */
     res = uccl::ucclProxyCreate(c);
     if (res != ucclSuccess) {
         UCCL_LOG(WARN, "Proxy creation failed");

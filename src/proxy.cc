@@ -9,37 +9,78 @@
 #include <cstring>
 
 /* Proxy thread implementation — async network I/O.
- * Mirrors NCCL src/proxy.cc.
  *
- * Architecture:
- * - GPU kernel handles intra-node P2P communication
- * - CPU proxy thread handles inter-node network I/O
- * - Synchronization via host-visible FIFO buffer + head/tail pointers
+ * Architecture (per design spec §7):
+ * - GPU kernel writes FIFO entries (ucclFifoEntry) and advances tail
+ * - Proxy thread polls tail, initiates isend/irecv via ucclNet plugin
+ * - When network op completes, proxy sets entry->done = 1 and advances head
+ * - GPU kernel polls done flag (overlapped with reduce computation)
  *
- * The proxy thread polls FIFO buffers and calls ucclNet plugin
- * isend/irecv/test to perform async network transfers.
- *
- * Timeline:
- *   GPU kernel: [reduce chunk0] [reduce chunk1] ...
- *                     |               |
- *                write FIFO      write FIFO
- *                     |               |
- *                     v               v
- *   Proxy:     [send chunk0]   [send chunk1]   ...
- *              [recv chunk0']  [recv chunk1']  ...
- *                     |               |
- *                write FIFO      write FIFO
- *                     v               v
- *   GPU kernel: [reduce chunk0'] [reduce chunk1'] ...
- */
+ * Ordering: entries are completed in FIFO order (head-of-line).
+ * This matches ring AllReduce step ordering. */
 
 namespace uccl {
 
+/* Process one direction of a channel's FIFO.
+ * Returns true if any work was done this iteration. */
+static bool processFifo(ucclNet_t* net, ucclConnFifo* fifo,
+                         void* netComm, bool isSend) {
+    if (fifo == nullptr || netComm == nullptr) return false;
+
+    bool worked = false;
+    uint64_t pending = fifo->pendingHead;
+
+    while (pending < fifo->tail) {
+        int slot = pending % UCCL_STEPS;
+        ucclFifoEntry* entry = &fifo->entries[slot];
+
+        if (entry->request == nullptr) {
+            /* New entry: initiate network operation */
+            ucclResult_t res = ucclSuccess;
+            switch (entry->opType) {
+            case UCCL_OP_SEND:
+            case UCCL_OP_PUT:
+                res = net->isend(netComm, entry->buff, entry->size,
+                                 entry->mhandle, &entry->request);
+                break;
+            case UCCL_OP_RECV:
+            case UCCL_OP_WAIT:
+                res = net->irecv(netComm, entry->buff, entry->size,
+                                 entry->mhandle, &entry->request);
+                break;
+            case UCCL_OP_SIGNAL:
+                /* Zero-byte send for signaling */
+                res = net->isend(netComm, nullptr, 0,
+                                 nullptr, &entry->request);
+                break;
+            }
+            if (res != ucclSuccess) {
+                UCCL_LOG(ERROR, "Proxy: failed to post %s op (slot %d)",
+                         isSend ? "send" : "recv", slot);
+                break;
+            }
+            worked = true;
+            pending++;
+        } else {
+            /* Already posted: check completion */
+            int done = 0;
+            net->test(entry->request, &done, nullptr);
+            if (done) {
+                entry->done = 1;            /* signal GPU kernel */
+                entry->request = nullptr;   /* reset for reuse */
+                fifo->pendingHead = ++pending;
+                fifo->head = pending;       /* free slot for kernel */
+                worked = true;
+            } else {
+                break; /* in-order completion: stop at first incomplete */
+            }
+        }
+    }
+    return worked;
+}
+
 /* Proxy progress function: runs on dedicated CPU thread.
- *
- * Continuously polls FIFO buffers for each channel.
- * When new data is available (tail advanced by GPU kernel),
- * initiates network send/recv via the ucclNet plugin. */
+ * Polls all channels' send/recv FIFOs and drives UCX progress. */
 static void proxyProgressFunc(ucclProxyState* state, ucclComm* comm) {
     UCCL_LOG(INFO, "Proxy thread started for rank %d", comm->rank);
 
@@ -50,28 +91,16 @@ static void proxyProgressFunc(ucclProxyState* state, ucclComm* comm) {
             break;
         }
 
-        /* Poll each channel's FIFO for pending operations */
+        bool anyWork = false;
+
+        /* Poll each channel's send and recv FIFOs */
         for (int ch = 0; ch < comm->nChannels; ch++) {
             ucclChannel& channel = comm->channels[ch];
 
-            /* Check send FIFO: if GPU kernel wrote new data (tail advanced),
-             * initiate network send */
-            for (int p = 0; p < UCCL_NUM_PROTOCOLS; p++) {
-                void* buff = channel.buffs[p];
-                if (buff == nullptr) continue;
-
-                /* In full implementation:
-                 * 1. Check connFifo->tail for new data
-                 * 2. If new data, call net->isend()
-                 * 3. Poll existing requests with net->test()
-                 * 4. When send completes, update connFifo->head
-                 *
-                 * Similarly for recv:
-                 * 1. Call net->irecv() to post receive
-                 * 2. Poll with net->test()
-                 * 3. When recv completes, update connFifo->tail
-                 *    so GPU kernel can read the data */
-            }
+            anyWork |= processFifo(state->net, channel.sendFifo,
+                                   channel.sendNetComm, /*isSend=*/true);
+            anyWork |= processFifo(state->net, channel.recvFifo,
+                                   channel.recvNetComm, /*isSend=*/false);
         }
 
         /* Drive UCX worker progress to advance async operations */
@@ -79,12 +108,7 @@ static void proxyProgressFunc(ucclProxyState* state, ucclComm* comm) {
             state->net->progress(state->netContext);
         }
 
-        /* Yield to avoid busy-waiting when idle.
-         * In production, use more sophisticated polling:
-         * - Batch multiple operations
-         * - Adaptive polling frequency
-         * - Event-based wakeup */
-        std::this_thread::yield();
+        if (!anyWork) std::this_thread::yield();
     }
 
     UCCL_LOG(INFO, "Proxy thread stopped for rank %d", comm->rank);

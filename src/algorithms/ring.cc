@@ -136,6 +136,158 @@ template ucclResult_t launchRingAllReduce<sycl::ext::oneapi::bfloat16>(
     sycl::ext::oneapi::bfloat16*,
     size_t, int, int, ucclChannel&, int);
 
+
+/* ============================================================
+ * Net Ring AllReduce — inter-node (via FIFO + bounce buffer + proxy)
+ *
+ * Persistent kernel: 1 workgroup on 1 Xe Core (0.6% EU on B60).
+ * Kernel loops internally over all ring steps.
+ * Communication with proxy through ucclConnFifo.
+ * ============================================================ */
+
+/* Build NetKernelArgs from channel state (called on host). */
+static NetKernelArgs buildNetKernelArgs(ucclChannel& channel) {
+    NetKernelArgs args{};
+
+    args.sendFifoHead = &channel.sendFifo->head;
+    args.sendFifoTail = &channel.sendFifo->tail;
+    args.recvFifoHead = &channel.recvFifo->head;
+    args.recvFifoTail = &channel.recvFifo->tail;
+
+    args.sendEntries = channel.sendFifo->entries;
+    args.recvEntries = channel.recvFifo->entries;
+
+    for (int i = 0; i < UCCL_STEPS; i++) {
+        args.bounceSendBuffs[i] = channel.bounceSend.buffs[i];
+        args.bounceRecvBuffs[i] = channel.bounceRecv.buffs[i];
+        args.bounceSendMhandles[i] = channel.bounceSend.mhandles[i];
+        args.bounceRecvMhandles[i] = channel.bounceRecv.mhandles[i];
+    }
+
+    return args;
+}
+
+template <typename T>
+ucclResult_t launchRingAllReduceNet(
+    sycl::queue& queue,
+    const T* sendbuff, T* recvbuff,
+    size_t count, int nranks, int rank,
+    ucclChannel& channel)
+{
+    if (channel.sendFifo == nullptr || channel.recvFifo == nullptr) {
+        UCCL_LOG(ERROR, "Net kernel: FIFOs not allocated for channel %d",
+                 channel.id);
+        return ucclInternalError;
+    }
+
+    /* Build kernel args on host (POD, captured by value) */
+    NetKernelArgs args = buildNetKernelArgs(channel);
+
+    /* Persistent kernel: 1 workgroup = 1 Xe Core */
+    constexpr size_t workGroupSize = 512;
+
+    queue.submit([&](sycl::handler& cgh) {
+        const T* send = sendbuff;
+        T* recv = recvbuff;
+        size_t cnt = count;
+        int nr = nranks;
+        int rk = rank;
+        NetKernelArgs kargs = args;
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(workGroupSize, workGroupSize),
+            [=](sycl::nd_item<1> item) {
+                NetPrimitives<T, ReduceSum<T>> prims(
+                    send, recv, kargs, item);
+
+                if (nr == 1) return;
+
+                size_t chunkCount = cnt / nr;
+                size_t remainder = cnt % nr;
+                int step = 0;
+
+                /* Phase 1: Reduce-Scatter (nr - 1 steps) */
+                for (int s = 0; s < nr - 1; s++, step++) {
+                    int sendChunk = ((rk - s) % nr + nr) % nr;
+                    int recvChunk = ((rk - s - 1) % nr + nr) % nr;
+
+                    size_t sendEltN = (sendChunk == nr - 1)
+                        ? chunkCount + remainder : chunkCount;
+                    size_t recvEltN = (recvChunk == nr - 1)
+                        ? chunkCount + remainder : chunkCount;
+                    size_t sendBytes = sendEltN * sizeof(T);
+                    size_t recvBytes = recvEltN * sizeof(T);
+
+                    const T* sendSrc = (s == 0)
+                        ? send + sendChunk * chunkCount
+                        : recv + sendChunk * chunkCount;
+
+                    prims.sendViaBounce(sendSrc, sendBytes, step);
+                    prims.postRecv(recvBytes, step);
+
+                    /* Overlap: reduce previous step's recv data */
+                    if (s > 0) {
+                        int prevRecvChunk = ((rk - s) % nr + nr) % nr;
+                        size_t prevRecvEltN = (prevRecvChunk == nr - 1)
+                            ? chunkCount + remainder : chunkCount;
+                        prims.waitRecv(step - 1);
+                        prims.reduceFromBounceRecv(
+                            recv + prevRecvChunk * chunkCount,
+                            recv + prevRecvChunk * chunkCount,
+                            prevRecvEltN, step - 1);
+                    }
+                }
+
+                /* Drain last reduce-scatter recv */
+                {
+                    int lastChunk = ((rk - (nr - 1)) % nr + nr) % nr;
+                    size_t lastEltN = (lastChunk == nr - 1)
+                        ? chunkCount + remainder : chunkCount;
+                    prims.waitRecv(step - 1);
+                    prims.reduceFromBounceRecv(
+                        recv + lastChunk * chunkCount,
+                        recv + lastChunk * chunkCount,
+                        lastEltN, step - 1);
+                }
+
+                /* Phase 2: AllGather (nr - 1 steps) */
+                for (int s = 0; s < nr - 1; s++, step++) {
+                    int sendChunk = ((rk + 1 - s) % nr + nr) % nr;
+                    int recvChunk = ((rk - s) % nr + nr) % nr;
+
+                    size_t sendEltN = (sendChunk == nr - 1)
+                        ? chunkCount + remainder : chunkCount;
+                    size_t recvEltN = (recvChunk == nr - 1)
+                        ? chunkCount + remainder : chunkCount;
+                    size_t sendBytes = sendEltN * sizeof(T);
+                    size_t recvBytes = recvEltN * sizeof(T);
+
+                    prims.sendViaBounce(
+                        recv + sendChunk * chunkCount,
+                        sendBytes, step);
+                    prims.postRecv(recvBytes, step);
+
+                    prims.waitRecv(step);
+                    prims.copyFromBounceRecv(
+                        recv + recvChunk * chunkCount,
+                        recvEltN, step);
+                }
+            });
+    });
+
+    return ucclSuccess;
+}
+
+template ucclResult_t launchRingAllReduceNet<sycl::half>(
+    sycl::queue&, const sycl::half*, sycl::half*,
+    size_t, int, int, ucclChannel&);
+
+template ucclResult_t launchRingAllReduceNet<sycl::ext::oneapi::bfloat16>(
+    sycl::queue&, const sycl::ext::oneapi::bfloat16*,
+    sycl::ext::oneapi::bfloat16*,
+    size_t, int, int, ucclChannel&);
+
+
 /* ============================================================
  * Ring AllGather
  *

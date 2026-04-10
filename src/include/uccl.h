@@ -104,10 +104,11 @@ ucclResult_t ucclSignal(int peer, int sigIdx, int ctx,
                         ucclComm_t comm, void* stream);
 
 typedef struct {
-    int opCnt;
-    int peer;
-    int sigIdx;
-    int ctx;
+    int opCnt;              /* Number of signal operations to wait for */
+    int peer;               /* Peer rank */
+    int sigIdx;             /* Signal index (must be 0 for now) */
+    int ctx;                /* Context identifier (must be 0 for now) */
+    ucclWindow_t win;       /* Window containing signal counters */
 } ucclWaitSignalDesc_t;
 
 ucclResult_t ucclWaitSignal(int nDesc,
