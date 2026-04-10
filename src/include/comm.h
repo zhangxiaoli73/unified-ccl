@@ -78,7 +78,7 @@ struct ucclComm {
     int localRanks;
 
     /* SYCL device & queue */
-    sycl::device device;
+    sycl::device* device;
     sycl::queue* defaultQueue;
 
     /* Topology */

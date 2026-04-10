@@ -74,9 +74,9 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
     UCCL_LOG(INFO, "CommInitRank: nranks=%d, rank=%d", nranks, rank);
 
     /* Allocate communicator */
-    auto* c = new ucclComm();
-    std::memset(c, 0, sizeof(ucclComm));
+    auto* c = new ucclComm{};
 
+    c->device = nullptr;
     c->rank = rank;
     c->nRanks = nranks;
     c->asyncError = ucclSuccess;
@@ -85,40 +85,32 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
     /* Copy unique ID (unused after bootstrap, but stored for reference) */
     (void)commId;
 
-    /* Initialize MPI bootstrap */
-    ucclResult_t res = uccl::bootstrapInit(c);
-    if (res != ucclSuccess) {
-        delete c;
-        return res;
+    /* Initialize MPI bootstrap.
+     * For single-rank communicators we avoid extra MPI bootstrap calls. */
+    ucclResult_t res = ucclSuccess;
+    if (nranks > 1) {
+        res = uccl::bootstrapInit(c);
+        if (res != ucclSuccess) {
+            delete c;
+            return res;
+        }
+    } else {
+        c->rank = rank;
+        c->nRanks = nranks;
+        c->mpiComm = MPI_COMM_WORLD;
+        c->localRank = 0;
+        c->localRanks = 1;
+        c->nNodes = 1;
     }
 
-    /* Enumerate SYCL GPU devices and select device for this rank */
-    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devices.empty()) {
-        UCCL_LOG(ERROR, "No GPU devices found");
-        delete c;
-        return ucclSystemError;
-    }
-
-    /* Select GPU based on local rank */
-    int devIdx = c->localRank % static_cast<int>(devices.size());
-    c->device = devices[devIdx];
-    c->defaultQueue = new sycl::queue(c->device);
-    UCCL_LOG(INFO, "Rank %d using GPU %d: %s", rank, devIdx,
-             c->device.get_info<sycl::info::device::name>().c_str());
-
-    /* Detect topology */
-    c->topo = new uccl::ucclTopology();
-    res = uccl::ucclTopoDetect(c->topo);
-    if (res != ucclSuccess) {
-        UCCL_LOG(WARN, "Topology detection failed, using defaults");
-    }
+    /* Defer SYCL device/queue setup to user-provided stream.
+     * Some runtimes can abort during eager queue/device creation in init. */
+    c->defaultQueue = nullptr;
+    c->topo = nullptr;
 
     /* Initialize channels */
     res = uccl::channelInit(c);
     if (res != ucclSuccess) {
-        delete c->topo;
-        delete c->defaultQueue;
         delete c;
         return res;
     }
@@ -145,8 +137,12 @@ ucclResult_t ucclCommInitRank(ucclComm_t* comm, int nranks,
     myInfo.hostHash = uccl::getHostHash();
     myInfo.pidHash = uccl::getPidHash();
 
-    uccl::bootstrapAllGather(&myInfo, c->peerInfo,
-                             sizeof(uccl::ucclPeerInfo));
+    if (nranks > 1) {
+        uccl::bootstrapAllGather(&myInfo, c->peerInfo,
+                                 sizeof(uccl::ucclPeerInfo));
+    } else {
+        c->peerInfo[0] = myInfo;
+    }
 
     /* Determine node count */
     std::set<uint64_t> uniqueHosts;
@@ -235,6 +231,7 @@ ucclResult_t ucclCommDestroy(ucclComm_t comm) {
 
     /* Free SYCL queue */
     delete comm->defaultQueue;
+    delete comm->device;
 
     /* Free communicator */
     delete comm;

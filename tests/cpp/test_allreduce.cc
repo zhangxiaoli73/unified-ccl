@@ -144,45 +144,61 @@ static int testAllReduceBf16(ucclComm_t comm, sycl::queue& queue,
 }
 
 int main(int argc, char** argv) {
-    /* MPI is initialized by uccl bootstrap, but we may need to call
-     * init for multi-process test launcher */
+    /* Only initialize MPI when this test is launched as multi-rank.
+     * In single-process mode, avoid MPI+SYCL runtime interaction issues. */
+    int rank = 0, nranks = 1;
+    bool useMpi = false;
+    bool mpiInitByUs = false;
     int mpiInit = 0;
     MPI_Initialized(&mpiInit);
-    if (!mpiInit) {
-        MPI_Init(&argc, &argv);
+    if (mpiInit) {
+        useMpi = true;
+    } else {
+        const char* pmiSize = std::getenv("PMI_SIZE");
+        const char* ompiSize = std::getenv("OMPI_COMM_WORLD_SIZE");
+        int launcherSize = 1;
+        if (pmiSize) launcherSize = std::atoi(pmiSize);
+        else if (ompiSize) launcherSize = std::atoi(ompiSize);
+        if (launcherSize > 1) {
+            MPI_Init(&argc, &argv);
+            useMpi = true;
+            mpiInitByUs = true;
+        }
     }
 
-    int rank, nranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+    if (useMpi) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+    }
 
     std::printf("[Rank %d/%d] Starting AllReduce test\n", rank, nranks);
+
+    /* Select GPU */
+    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+    if (devices.empty()) {
+        std::fprintf(stderr, "[Rank %d] No GPU devices found\n", rank);
+        if (mpiInitByUs) MPI_Finalize();
+        return 1;
+    }
+
+    int devIdx = rank % static_cast<int>(devices.size());
+    sycl::queue queue(devices[devIdx]);
 
     /* Initialize UCCL communicator */
     ucclUniqueId id;
     if (rank == 0) ucclGetUniqueId(&id);
-    MPI_Bcast(&id, sizeof(ucclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+    if (useMpi) {
+        MPI_Bcast(&id, sizeof(ucclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+    }
 
     ucclComm_t comm;
     ucclResult_t res = ucclCommInitRank(&comm, nranks, id, rank);
     if (res != ucclSuccess) {
         std::fprintf(stderr, "[Rank %d] CommInitRank failed: %s\n",
                      rank, ucclGetErrorString(res));
-        MPI_Finalize();
+        if (mpiInitByUs) MPI_Finalize();
         return 1;
     }
-
-    /* Select GPU */
-    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devices.empty()) {
-        std::fprintf(stderr, "[Rank %d] No GPU devices found\n", rank);
-        ucclCommDestroy(comm);
-        MPI_Finalize();
-        return 1;
-    }
-
-    int devIdx = rank % static_cast<int>(devices.size());
-    sycl::queue queue(devices[devIdx]);
 
     /* Run tests */
     int totalErrors = 0;
@@ -195,8 +211,12 @@ int main(int argc, char** argv) {
 
     /* Summary */
     int globalErrors = 0;
-    MPI_Allreduce(&totalErrors, &globalErrors, 1,
-                  MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (useMpi) {
+        MPI_Allreduce(&totalErrors, &globalErrors, 1,
+                      MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    } else {
+        globalErrors = totalErrors;
+    }
 
     if (rank == 0) {
         if (globalErrors == 0) {
@@ -206,6 +226,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    MPI_Finalize();
+    if (mpiInitByUs) MPI_Finalize();
     return (globalErrors == 0) ? 0 : 1;
 }

@@ -6,7 +6,7 @@
 
 include(FetchContent)
 
-option(UCCL_UCX_TAG "UCX version tag to fetch" "v1.17.0")
+set(UCCL_UCX_TAG "v1.17.0" CACHE STRING "UCX version tag to fetch")
 
 FetchContent_Declare(
     ucx
@@ -25,6 +25,7 @@ include(ExternalProject)
 
 set(UCX_SOURCE_DIR ${ucx_SOURCE_DIR})
 set(UCX_INSTALL_DIR ${CMAKE_BINARY_DIR}/third_party/ucx/install)
+file(MAKE_DIRECTORY ${UCX_INSTALL_DIR}/include ${UCX_INSTALL_DIR}/lib)
 
 ExternalProject_Add(ucx_build
     SOURCE_DIR      ${UCX_SOURCE_DIR}
@@ -40,9 +41,9 @@ ExternalProject_Add(ucx_build
             --without-java
             --without-go
 
-    BUILD_COMMAND     make -j$ENV{NPROC}
-    INSTALL_COMMAND   make install
-    BUILD_IN_SOURCE   FALSE
+    BUILD_COMMAND     make -C ${UCX_SOURCE_DIR} -j$ENV{NPROC}
+    INSTALL_COMMAND   make -C ${UCX_SOURCE_DIR} install
+    BUILD_IN_SOURCE   TRUE
     BUILD_BYPRODUCTS
         ${UCX_INSTALL_DIR}/lib/libucp.so
         ${UCX_INSTALL_DIR}/lib/libuct.so

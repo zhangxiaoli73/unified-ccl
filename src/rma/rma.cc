@@ -79,8 +79,15 @@ ucclResult_t ucclWindowRegister(ucclWindow_t* win, void* buff,
     /* Level Zero IPC handle exchange */
     auto zeCtx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
         comm->defaultQueue->get_context());
+    if (comm->device == nullptr) {
+        UCCL_LOG(ERROR, "WindowRegister: communicator has no device");
+        delete[] w->remotePtrs;
+        delete[] w->remoteSignals;
+        delete w;
+        return ucclSystemError;
+    }
     auto zeDev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
-        comm->device);
+        *comm->device);
 
     ze_ipc_mem_handle_t localHandle;
     ze_result_t zeRes = zeMemGetIpcHandle(zeCtx, buff, &localHandle);
